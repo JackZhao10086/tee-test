@@ -88,6 +88,13 @@ func TestRunVerifyWritesValidJSON(t *testing.T) {
 	}
 }
 
+func TestRunExistsRequiresLabelAndTag(t *testing.T) {
+	var stdout bytes.Buffer
+	if err := Run([]string{"exists", "--label", "only-label"}, &stdout); err == nil {
+		t.Fatal("expected exists without tag to fail")
+	}
+}
+
 func TestRunRejectsUnknownCommand(t *testing.T) {
 	var stdout bytes.Buffer
 	if err := Run([]string{"bogus"}, &stdout); err == nil {

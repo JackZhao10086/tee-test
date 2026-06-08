@@ -137,6 +137,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -229,6 +230,36 @@ func createKey(label, tag string) (*keyResult, error) {
 	}
 
 	return &keyResult{PublicKey: &privateKey.PublicKey}, nil
+}
+
+func lookupKey(label, tag string) (*keyLookupResult, error) {
+	metadata, err := readDarwinMetadata(label, tag)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &keyLookupResult{Exists: false}, nil
+		}
+		return nil, err
+	}
+
+	appLabel, err := hex.DecodeString(metadata.AppLabel)
+	if err != nil {
+		return nil, fmt.Errorf("decode key metadata app label: %w", err)
+	}
+	if err := ensureDarwinKeyImported(appLabel); err != nil {
+		return &keyLookupResult{
+			Exists: false,
+			Note:   err.Error(),
+		}, nil
+	}
+
+	publicKey, err := teesks.DecodePublicKey(metadata.PublicKey)
+	if err != nil {
+		return nil, err
+	}
+	return &keyLookupResult{
+		Exists:    true,
+		PublicKey: publicKey,
+	}, nil
 }
 
 func signWithKey(label, tag, message string) (*signResult, error) {

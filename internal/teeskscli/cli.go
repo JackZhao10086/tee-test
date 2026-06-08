@@ -31,6 +31,14 @@ type createOutput struct {
 	PublicKey string `json:"public_key"`
 }
 
+type existsOutput struct {
+	Label     string `json:"label"`
+	Tag       string `json:"tag"`
+	Exists    bool   `json:"exists"`
+	PublicKey string `json:"public_key,omitempty"`
+	Note      string `json:"note,omitempty"`
+}
+
 type signOutput struct {
 	Message   string `json:"message"`
 	Signature string `json:"signature"`
@@ -51,6 +59,8 @@ func Run(args []string, stdout io.Writer) error {
 		return runCheck(args[1:], stdout)
 	case "create":
 		return runCreate(args[1:], stdout)
+	case "exists":
+		return runExists(args[1:], stdout)
 	case "sign":
 		return runSign(args[1:], stdout)
 	case "verify":
@@ -145,6 +155,40 @@ func runCreate(args []string, stdout io.Writer) error {
 	})
 }
 
+func runExists(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("exists", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	label := flags.String("label", "", "key label")
+	tag := flags.String("tag", "", "key tag")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if err := requireLabelTag(*label, *tag); err != nil {
+		return err
+	}
+
+	result, err := lookupKey(*label, *tag)
+	if err != nil {
+		return fmt.Errorf("lookup key: %w", err)
+	}
+
+	output := existsOutput{
+		Label:  *label,
+		Tag:    *tag,
+		Exists: result.Exists,
+		Note:   result.Note,
+	}
+	if result.Exists {
+		encodedPublicKey, err := teesks.EncodePublicKey(result.PublicKey)
+		if err != nil {
+			return err
+		}
+		output.PublicKey = encodedPublicKey
+	}
+
+	return writeJSON(stdout, output)
+}
+
 func runSign(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("sign", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -221,5 +265,5 @@ func writeJSON(stdout io.Writer, value any) error {
 }
 
 func usageError(message string) error {
-	return fmt.Errorf("%s\nusage:\n  tee-sks check\n  tee-sks create --label <label> --tag <tag>\n  tee-sks sign --label <label> --tag <tag> --message <string>\n  tee-sks verify --message <string> --signature <base64> --public-key <base64>", message)
+	return fmt.Errorf("%s\nusage:\n  tee-sks check\n  tee-sks create --label <label> --tag <tag>\n  tee-sks exists --label <label> --tag <tag>\n  tee-sks sign --label <label> --tag <tag> --message <string>\n  tee-sks verify --message <string> --signature <base64> --public-key <base64>", message)
 }
