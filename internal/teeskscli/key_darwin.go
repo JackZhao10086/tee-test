@@ -13,7 +13,26 @@ static CFDataRef cf_data(const void *bytes, int len) {
 	return CFDataCreate(kCFAllocatorDefault, bytes, len);
 }
 
-static int find_private_key_by_app_label(const unsigned char *appLabel, int appLabelLen, SecKeyRef *outKey) {
+static int add_keychain_search_list(CFMutableDictionaryRef query, const char *keychainPath) {
+	SecKeychainRef keychain = NULL;
+	OSStatus status = SecKeychainOpen(keychainPath, &keychain);
+	if (status != errSecSuccess) {
+		return (int)status;
+	}
+
+	const void *values[] = { keychain };
+	CFArrayRef searchList = CFArrayCreate(kCFAllocatorDefault, values, 1, &kCFTypeArrayCallBacks);
+	CFRelease(keychain);
+	if (searchList == NULL) {
+		return -2;
+	}
+
+	CFDictionarySetValue(query, kSecMatchSearchList, searchList);
+	CFRelease(searchList);
+	return 0;
+}
+
+static int find_private_key_by_app_label(const unsigned char *appLabel, int appLabelLen, const char *keychainPath, SecKeyRef *outKey) {
 	CFDataRef cfAppLabel = cf_data(appLabel, appLabelLen);
 	if (cfAppLabel == NULL) {
 		return -2;
@@ -30,6 +49,12 @@ static int find_private_key_by_app_label(const unsigned char *appLabel, int appL
 	CFDictionarySetValue(query, kSecAttrKeyType, kSecAttrKeyTypeRSA);
 	CFDictionarySetValue(query, kSecAttrApplicationLabel, cfAppLabel);
 	CFDictionarySetValue(query, kSecReturnRef, kCFBooleanTrue);
+	int searchResult = add_keychain_search_list(query, keychainPath);
+	if (searchResult != 0) {
+		CFRelease(query);
+		CFRelease(cfAppLabel);
+		return searchResult;
+	}
 
 	CFTypeRef item = NULL;
 	OSStatus status = SecItemCopyMatching(query, &item);
@@ -43,7 +68,7 @@ static int find_private_key_by_app_label(const unsigned char *appLabel, int appL
 	return 0;
 }
 
-static int set_private_key_label(const unsigned char *appLabel, int appLabelLen, const char *label) {
+static int set_private_key_label(const unsigned char *appLabel, int appLabelLen, const char *keychainPath, const char *label) {
 	CFDataRef cfAppLabel = cf_data(appLabel, appLabelLen);
 	CFStringRef cfLabel = CFStringCreateWithCString(kCFAllocatorDefault, label, kCFStringEncodingUTF8);
 	if (cfAppLabel == NULL || cfLabel == NULL) {
@@ -62,6 +87,13 @@ static int set_private_key_label(const unsigned char *appLabel, int appLabelLen,
 	CFDictionarySetValue(query, kSecAttrKeyClass, kSecAttrKeyClassPrivate);
 	CFDictionarySetValue(query, kSecAttrKeyType, kSecAttrKeyTypeRSA);
 	CFDictionarySetValue(query, kSecAttrApplicationLabel, cfAppLabel);
+	int searchResult = add_keychain_search_list(query, keychainPath);
+	if (searchResult != 0) {
+		CFRelease(query);
+		CFRelease(cfAppLabel);
+		CFRelease(cfLabel);
+		return searchResult;
+	}
 
 	CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(
 		kCFAllocatorDefault,
@@ -79,9 +111,9 @@ static int set_private_key_label(const unsigned char *appLabel, int appLabelLen,
 	return (int)status;
 }
 
-static int sign_with_nonextractable_key(const unsigned char *appLabel, int appLabelLen, const unsigned char *digest, int digestLen, unsigned char **sigOut, long *sigLen) {
+static int sign_with_nonextractable_key(const unsigned char *appLabel, int appLabelLen, const char *keychainPath, const unsigned char *digest, int digestLen, unsigned char **sigOut, long *sigLen) {
 	SecKeyRef privateKey = NULL;
-	int result = find_private_key_by_app_label(appLabel, appLabelLen, &privateKey);
+	int result = find_private_key_by_app_label(appLabel, appLabelLen, keychainPath, &privateKey);
 	if (result != 0) {
 		return result;
 	}
@@ -202,18 +234,18 @@ func createKey(label, tag string) (*keyResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve current executable: %w", err)
 	}
-	defaultKeychain, err := defaultKeychainPath()
+	keychain, err := ensureDarwinKeychain()
 	if err != nil {
 		return nil, err
 	}
-	importCmd := exec.Command("security", "import", privateKeyPath, "-k", defaultKeychain, "-t", "priv", "-f", "openssl", "-x", "-T", executable)
+	importCmd := exec.Command("security", "import", privateKeyPath, "-k", keychain, "-t", "priv", "-f", "openssl", "-x", "-A", "-T", executable)
 	if output, err := importCmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("import non-extractable key: %w: %s", err, string(output))
 	}
-	if err := ensureDarwinKeyImported(appLabel[:]); err != nil {
+	if err := ensureDarwinKeyImported(appLabel[:], keychain); err != nil {
 		return nil, err
 	}
-	if err := setDarwinKeyLabel(appLabel[:], label); err != nil {
+	if err := setDarwinKeyLabel(appLabel[:], keychain, label); err != nil {
 		return nil, err
 	}
 
@@ -241,17 +273,6 @@ func lookupKey(label, tag string) (*keyLookupResult, error) {
 		return nil, err
 	}
 
-	appLabel, err := hex.DecodeString(metadata.AppLabel)
-	if err != nil {
-		return nil, fmt.Errorf("decode key metadata app label: %w", err)
-	}
-	if err := ensureDarwinKeyImported(appLabel); err != nil {
-		return &keyLookupResult{
-			Exists: false,
-			Note:   err.Error(),
-		}, nil
-	}
-
 	publicKey, err := teesks.DecodePublicKey(metadata.PublicKey)
 	if err != nil {
 		return nil, err
@@ -275,6 +296,12 @@ func signWithKey(label, tag, message string) (*signResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	keychain, err := ensureDarwinKeychain()
+	if err != nil {
+		return nil, err
+	}
+	cKeychain := C.CString(keychain)
+	defer C.free(unsafe.Pointer(cKeychain))
 
 	digest := sha256.Sum256([]byte(message))
 	var sig *C.uchar
@@ -282,6 +309,7 @@ func signWithKey(label, tag, message string) (*signResult, error) {
 	status := C.sign_with_nonextractable_key(
 		(*C.uchar)(unsafe.Pointer(&appLabel[0])),
 		C.int(len(appLabel)),
+		cKeychain,
 		(*C.uchar)(unsafe.Pointer(&digest[0])),
 		C.int(len(digest)),
 		&sig,
@@ -328,11 +356,14 @@ func writeDarwinMetadata(path string, metadata darwinKeyMetadata) error {
 	return nil
 }
 
-func ensureDarwinKeyImported(appLabel []byte) error {
+func ensureDarwinKeyImported(appLabel []byte, keychain string) error {
+	cKeychain := C.CString(keychain)
+	defer C.free(unsafe.Pointer(cKeychain))
 	var key C.SecKeyRef
 	status := C.find_private_key_by_app_label(
 		(*C.uchar)(unsafe.Pointer(&appLabel[0])),
 		C.int(len(appLabel)),
+		cKeychain,
 		&key,
 	)
 	if status != 0 {
@@ -342,18 +373,101 @@ func ensureDarwinKeyImported(appLabel []byte) error {
 	return nil
 }
 
-func setDarwinKeyLabel(appLabel []byte, label string) error {
+func setDarwinKeyLabel(appLabel []byte, keychain, label string) error {
+	cKeychain := C.CString(keychain)
+	defer C.free(unsafe.Pointer(cKeychain))
 	cLabel := C.CString(label)
 	defer C.free(unsafe.Pointer(cLabel))
 	status := C.set_private_key_label(
 		(*C.uchar)(unsafe.Pointer(&appLabel[0])),
 		C.int(len(appLabel)),
+		cKeychain,
 		cLabel,
 	)
 	if status != 0 {
 		return keychainError("set keychain key label", int(status))
 	}
 	return nil
+}
+
+func ensureDarwinKeychain() (string, error) {
+	keychainPath, err := darwinKeychainPath()
+	if err != nil {
+		return "", err
+	}
+	password, err := darwinKeychainPassword()
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := os.Stat(keychainPath); err != nil {
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("stat app keychain: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(keychainPath), 0700); err != nil {
+			return "", fmt.Errorf("create app keychain directory: %w", err)
+		}
+		createCmd := exec.Command("security", "create-keychain", "-p", password, keychainPath)
+		if output, err := createCmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("create app keychain: %w: %s", err, string(output))
+		}
+		settingsCmd := exec.Command("security", "set-keychain-settings", keychainPath)
+		if output, err := settingsCmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("set app keychain settings: %w: %s", err, string(output))
+		}
+		unlockCmd := exec.Command("security", "unlock-keychain", "-p", password, keychainPath)
+		if output, err := unlockCmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("unlock app keychain: %w: %s", err, string(output))
+		}
+	}
+	return keychainPath, nil
+}
+
+func darwinKeychainPath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user config directory: %w", err)
+	}
+	return filepath.Join(configDir, "tee-test", "tee-test.keychain"), nil
+}
+
+func darwinKeychainPassword() (string, error) {
+	path, err := darwinKeychainPasswordPath()
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(path)
+	if err == nil {
+		password := strings.TrimSpace(string(data))
+		if password == "" {
+			return "", fmt.Errorf("read app keychain password: empty password")
+		}
+		return password, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", fmt.Errorf("read app keychain password: %w", err)
+	}
+
+	passwordBytes := make([]byte, 32)
+	if _, err := rand.Read(passwordBytes); err != nil {
+		return "", fmt.Errorf("generate app keychain password: %w", err)
+	}
+	password := hex.EncodeToString(passwordBytes)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return "", fmt.Errorf("create app keychain password directory: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(password+"\n"), 0600); err != nil {
+		return "", fmt.Errorf("write app keychain password: %w", err)
+	}
+	return password, nil
+}
+
+func darwinKeychainPasswordPath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user config directory: %w", err)
+	}
+	return filepath.Join(configDir, "tee-test", "keychain.pass"), nil
 }
 
 func defaultKeychainPath() (string, error) {
